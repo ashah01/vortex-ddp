@@ -483,7 +483,11 @@ class ParallelGatedConvBlock(nn.Module):
 
         normalized = self.pre_norm(x)
         normalized = self.pad_to_multiple(normalized)
-        with torch.cuda.device(x.device):
+        # Respect current device; avoid forcing CUDA contexts on CPU tensors.
+        if x.is_cuda:
+            with torch.cuda.device(x.device):
+                projected = self.projections(normalized)
+        else:
             projected = self.projections(normalized)
 
         if isinstance(projected, tuple):
@@ -615,8 +619,9 @@ class StripedHyena(nn.Module):
         self.ground_truth_activations_path = config.get("ground_truth_activations_path", None)
         self.logger.info(f"Initializing StripedHyena with config: {config}")
 
-        with torch.device("cuda:0" if torch.cuda.is_available() else "cpu"):
-            self.embedding_layer = VocabParallelEmbedding(config)
+        # Initialize layers without pinning to a specific CUDA device.
+        # Let callers (e.g., PyTorch Lightning) handle device placement.
+        self.embedding_layer = VocabParallelEmbedding(config)
 
         if config.get("use_flashfft", "True"):
             try:
@@ -634,48 +639,23 @@ class StripedHyena(nn.Module):
             )
         self.logger.info(f"Initializing {config.num_layers} blocks...")
         self.blocks = nn.ModuleList()
-        self.block_idx_to_device = {}
-
-        # Calculate layers per GPU
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        layers_per_gpu = math.ceil(config.num_layers / num_gpus)
-        self.logger.info(f"Distributing across {num_gpus} GPUs, approximately {layers_per_gpu} layers per GPU")
-
         for layer_idx in tqdm(range(config.num_layers)):
-            # Determine which GPU should handle this layer
-            device_idx = min(layer_idx // layers_per_gpu, num_gpus - 1)
-            device = f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu"
-
-            with torch.device(device):
-                # TELinear uses `device="cuda"` device to allocate empty bias
-                # tensor. This makes sure that the empty tensor is allocated on the
-                # correct device. (torch.device(), unlike torch.cuda.device(),
-                # doesn't override current CUDA device.)
-                with torch.cuda.device(device):
-                    block = get_block(config, layer_idx, flash_fft=self.flash_fft)
-                    move_to_device(block, device)
-
+            block = get_block(config, layer_idx, flash_fft=self.flash_fft)
             self.blocks.append(block)
-            self.block_idx_to_device[layer_idx] = device
-            self.logger.info(f"Assigned {layer_idx=} to {device=}")
             self.logger.info(
                 f"Parameter count for block {layer_idx}: {sum(p.numel() for p in self.blocks[-1].parameters())}"
             )
 
-        with torch.device(self.block_idx_to_device[0]):
-            with torch.cuda.device(self.block_idx_to_device[0]):
-                self.norm = RMSNorm(config) if config.get("final_norm", True) else None
-                if config.tie_embeddings:
-                    # Lambda usage is to be able to use forward() on caller side, which in
-                    # turn is needed for PyTorch hooks to work properly.
-                    self.unembed = Lambda(self.embedding_layer.unembed)
-                else:
-                    if config.tie_embeddings:
-                        # Technically we can support this mode, just need to
-                        # copy tensors across GPUs then. But let's implement it
-                        # once/if needed.
-                        self.logger.info("Ignoring tie_embeddings for now.")
-                    self.unembed = VocabParallelUnembedding(config)
+        # Final layers on default device; Lightning will move them.
+        self.norm = RMSNorm(config) if config.get("final_norm", True) else None
+        if config.tie_embeddings:
+            # Lambda usage is to be able to use forward() on caller side, which in
+            # turn is needed for PyTorch hooks to work properly.
+            self.unembed = Lambda(self.embedding_layer.unembed)
+        else:
+            if config.tie_embeddings:
+                self.logger.info("Ignoring tie_embeddings for now.")
+            self.unembed = VocabParallelUnembedding(config)
 
         self.logger.info("Initialized model")
 
@@ -700,8 +680,6 @@ class StripedHyena(nn.Module):
         if self.print_activations:
             activations_logger.info(f"pre norm: {x}, {x.min()}, {x.max()}")
 
-        # By convention, we return results on the first device
-        x = x.to(self.block_idx_to_device[0])
         x = self.norm(x)
 
         if self.print_activations:
@@ -722,10 +700,7 @@ class StripedHyena(nn.Module):
         else:
             raise ValueError(f"Block index {block_idx} not found")
 
-    def cross_device_transfer(self, x, block_idx):
-        if self.block_idx_to_device[max(block_idx - 1, 0)] != self.block_idx_to_device[block_idx]:
-            x = x.to(self.block_idx_to_device[block_idx])
-        return x
+    # Removed cross-device transfers; Lightning handles device placement.
 
     def stateful_forward(self, x, inference_params_dict=None):
         for block_idx, block in enumerate(self.blocks):
@@ -740,7 +715,6 @@ class StripedHyena(nn.Module):
                         f"pre block {block_idx} activation_diff: {activation_diff.max()}, {activation_diff.mean()}"
                     )
 
-            x = self.cross_device_transfer(x, block_idx)
             x, _ = block(x, inference_params=inference_params)
 
             if self.print_activations:
@@ -768,7 +742,6 @@ class StripedHyena(nn.Module):
                         f"pre block {block_idx} activation_diff: {activation_diff.max()}, {activation_diff.mean()}"
                     )
 
-            x = self.cross_device_transfer(x, block_idx)
             x, _ = block(x, inference_params=None, padding_mask=padding_mask)
 
             if self.print_activations:
